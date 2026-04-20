@@ -1,9 +1,10 @@
-// A single, unified 32-bit entry
+// A single, unified 32-bit entry perfectly sized for our blackboxes
 typedef struct packed {
-    logic        valid;  // 1 bit
-    logic [12:0]  tag;    // 13 bits (PC[15:3]) [SIZE]
-    logic [1:0]  mode;   // 2 bits  (Saturating counter)
-    logic [15:0] target; // 16 bits (Branch Target)
+    logic        padding; // 1 bit   (Unused, pads to exactly 32 bits)
+    logic        valid;   // 1 bit
+    logic [11:0] tag;     // 12 bits (PC[15:4]) 
+    logic [1:0]  mode;    // 2 bits  (Saturating counter)
+    logic [15:0] target;  // 16 bits (Branch Target)
 } btb_entry_t; 
 
 module btb (
@@ -11,38 +12,50 @@ module btb (
     input  logic rst,
 
     // READ PORT (Fetch Stage)
-    input  logic [31:0]  read_pc,
+    input  logic [15:0]  read_pc,
     output btb_read_data rdata, 
 
     // WRITE PORT (Execute Stage)
     input  btb_write_data wdata
 );
 
-// [SIZE]
-// Our single array of 8 discrete size(btb_entry_t) registers
-btb_entry_t btb_array [8]; 
+// 16 discrete register outputs
+logic [31:0] btb_q [15:0];
 
 // ==========================================
-// READ PORT: Combinational Read
+// READ PORT: 16-to-1 Combinational Read
 // ==========================================
-logic [2:0] read_idx; // [SIZE]
-logic [12:0] read_tag; // [SIZE]
+logic [3:0]  read_idx; 
+logic [11:0] read_tag; 
 
-assign read_idx = read_pc[2:0]; // [SIZE]
-assign read_tag = read_pc[15:3]; // [SIZE]
+// Word-addressable: Index starts directly at bit 0
+assign read_idx = read_pc[3:0]; 
+assign read_tag = read_pc[15:4]; 
 
-btb_entry_t active_entry;
-assign active_entry = btb_array[read_idx];
+logic [31:0] active_entry_raw;
+btb_entry_t  active_entry;
+
+// Cast the 32-bit raw output back to our struct
+assign active_entry = active_entry_raw;
+
+// The Native 16-to-1 Read MUX
+cs_mux_16to1 read_mux (
+    .d0(btb_q[0]),   .d1(btb_q[1]),   .d2(btb_q[2]),   .d3(btb_q[3]),
+    .d4(btb_q[4]),   .d5(btb_q[5]),   .d6(btb_q[6]),   .d7(btb_q[7]),
+    .d8(btb_q[8]),   .d9(btb_q[9]),   .d10(btb_q[10]), .d11(btb_q[11]),
+    .d12(btb_q[12]), .d13(btb_q[13]), .d14(btb_q[14]), .d15(btb_q[15]),
+    .sel(read_idx), 
+    .y(active_entry_raw)
+);
 
 always_comb begin
     rdata.valid  = 1'b0;
     rdata.take   = 1'b0;
-    rdata.target = 32'd0;
+    rdata.target = 16'd0;
 
     if (active_entry.valid && active_entry.tag == read_tag) begin
         rdata.valid  = 1'b1;
-        // Pad the 16-bit stored target back to 32 bits at zero cost
-        rdata.target = {16'd0, active_entry.target};
+        rdata.target = active_entry.target;
         rdata.take   = (active_entry.mode >= 2'b10); 
     end
 end
@@ -50,16 +63,27 @@ end
 // ==========================================
 // WRITE PORT: Calculate Next State
 // ==========================================
-logic [2:0] up_idx; // [SIZE]
-logic [12:0] up_tag; // [SIZE]
+logic [3:0]  up_idx; 
+logic [11:0] up_tag; 
 
-assign up_idx = wdata.pc[2:0];
-assign up_tag = wdata.pc[15:3];
+assign up_idx = wdata.pc[3:0];
+assign up_tag = wdata.pc[15:4];
 
-btb_entry_t current_entry;
-btb_entry_t next_entry;
+logic [31:0] current_entry_raw;
+btb_entry_t  current_entry;
+btb_entry_t  next_entry;
 
-assign current_entry = btb_array[up_idx];
+assign current_entry = current_entry_raw;
+
+// The Native 16-to-1 Write MUX
+cs_mux_16to1 write_mux (
+    .d0(btb_q[0]),   .d1(btb_q[1]),   .d2(btb_q[2]),   .d3(btb_q[3]),
+    .d4(btb_q[4]),   .d5(btb_q[5]),   .d6(btb_q[6]),   .d7(btb_q[7]),
+    .d8(btb_q[8]),   .d9(btb_q[9]),   .d10(btb_q[10]), .d11(btb_q[11]),
+    .d12(btb_q[12]), .d13(btb_q[13]), .d14(btb_q[14]), .d15(btb_q[15]),
+    .sel(up_idx), 
+    .y(current_entry_raw)
+);
 
 always_comb begin
     // Default: keep exactly what's there
@@ -72,41 +96,40 @@ always_comb begin
         end else if (!wdata.taken && current_entry.mode > 2'b00) begin 
             next_entry.mode = current_entry.mode - 2'd1;
         end
-        // Refresh the target just in case, though it shouldn't normally change on a hit
-        next_entry.target = wdata.target[15:0];
+        next_entry.target = wdata.target;
     end else begin
         // Miss: Evict and allocate 
-        next_entry.valid  = 1'b1;
-        next_entry.tag    = up_tag;
-        next_entry.mode   = wdata.taken ? 2'b10 : 2'b01; 
-        next_entry.target = wdata.target[15:0]; // Slice the bottom 16 bits
+        next_entry.padding = 1'b0; // Updated padding to 1 bit
+        next_entry.valid   = 1'b1;
+        next_entry.tag     = up_tag;
+        next_entry.mode    = wdata.taken ? 2'b10 : 2'b01; 
+        next_entry.target  = wdata.target; 
     end
 end
 
 // ==========================================
 // WRITE PORT EXECUTION: The Generate Loop
 // ==========================================
+logic [15:0] write_decode;
 
-// [SIZE]
-logic [7:0] write_decode;
-// Forcing this into a MUX instead of a bunch of MUX's and Splitter's
-// [SIZE]
-assign write_decode = wdata.write ? (8'd1 << up_idx) : '0;
+// Drive exactly 1 line of the 16-bit bus high if we are writing
+assign write_decode = wdata.write ? (16'd1 << up_idx) : 16'd0;
+
+logic [31:0] next_entry_raw;
+assign next_entry_raw = next_entry; // Cast for the blackbox
 
 genvar i;
 generate
-// [SIZE]
-for (i = 0; i < 8; i++) begin : BTB_REGS
-    always_ff @(posedge clk) begin
-        if (rst) begin
-            // Only clear the valid bit to save routing overhead on reset
-            btb_array[i]  <= '0;
-        end else if (write_decode[i]) begin
-            // Single, clean assignment
-            btb_array[i] <= next_entry;
-        end
+    // Unroll 16 discrete physical registers
+    for (i = 0; i < 16; i++) begin : BTB_REGS
+        cs_register btb_reg (
+            .clk(clk),
+            .clr(rst),
+            .en(write_decode[i]),
+            .d(next_entry_raw),
+            .q(btb_q[i])
+        );
     end
-end
 endgenerate
 
 endmodule
